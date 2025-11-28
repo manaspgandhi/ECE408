@@ -1,0 +1,164 @@
+// OPTIMIZATION 1: Sweeping various parameters to find best values (block sizes, amount of thread coarsening) (0.5 points)
+// OPTIMIZATION 2: Weight matrix (kernel values) in constant memory (0.5 points)
+// OPTIMIZATION 3: FP16 arithmetic. (4 points)
+// OPTIMIZATION 4: Input channel reduction: atomics (2 points)
+// OPTIMIZATION 5: Using Streams to overlap computation with data transfer (4 points)
+// OPTIMIZATION 6: Tuning with restrict and loop unrolling (3 points)
+// TOTAL POINTS: 14
+
+// IMPORTANT: in this final submission, we have only implemented optimizations 1 & 2
+// In the 'Optimizations' folder, optimizations 3 - 6 are implemented in their various files
+
+#include <cmath>
+#include <iostream>
+#include "gpu-new-forward.h"
+// OPTIMIZATION 1: This TILE_WIDTH constant defines the x and y dimensions of the block 
+#define TILE_WIDTH 12
+
+// OPTIMIZATION 2: This is the constant memory optimization, putting the mask into constant memory
+#define MASK_WIDTH 4000
+__constant__ float mask_constant_memory[MASK_WIDTH];
+
+__global__ void conv_forward_kernel(float *output, const float *input, const float *mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
+{
+    /*
+    Modify this function to implement the forward pass described in Chapter 16.
+    We have added an additional dimension to the tensors to support an entire mini-batch
+    The goal here is to be correct AND fast.
+
+    Function paramter definitions:
+    output - output
+    input - input
+    mask - convolution kernel
+    B - batch_size (number of images in x)
+    M - number of output feature maps
+    C - number of input feature maps
+    H - input height dimension
+    W - input width dimension
+    K - kernel height and width (K x K)
+    S - stride step length
+    */
+
+    #define out_4d(i3, i2, i1, i0) output[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+    #define in_4d(i3, i2, i1, i0) input[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+    #define mask_4d(i3, i2, i1, i0) mask_constant_memory[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+
+    // Insert your GPU convolution kernel code here
+    
+    // define the size of H and W outputs
+    const int H_out = (H - K)/S + 1;
+    const int W_out = (W - K)/S + 1;
+    int b = blockIdx.x;
+    int m = blockIdx.y;
+    int bz = blockIdx.z;
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+        
+    int W_size = ceil((float)(W)/TILE_WIDTH);
+
+    // current h and w sizes 
+    int h = (bz / W_size) * TILE_WIDTH + ty;
+    int w = (bz % W_size) * TILE_WIDTH + tx;
+
+    // the convolution is in here
+    if(w < W_out && h < H_out && m < M){
+        float conv_result = 0.0f;
+        for(int c = 0; c < C; c++){
+            #pragma unroll(8)
+            for(int p = 0; p < K; p++){
+                #pragma unroll(7)
+                for(int q = 0; q < K; q++) {
+                    #pragma unroll(7)
+                    // add to conv_result
+                    conv_result += in_4d(b, c, h * S + p, w * S + q) * mask_4d(m, c, p, q);
+                }
+            }
+        }
+        // put it in the outpu
+        out_4d(b, m, h, w) = conv_result;
+    }
+
+    #undef out_4d
+    #undef in_4d
+    #undef mask_4d
+}
+
+	
+__host__ void GPUInterface::conv_forward_gpu_prolog(const float *host_output, const float *host_input, const float *host_mask, float **device_output_ptr, float **device_input_ptr, float **device_mask_ptr, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
+{
+    // Allocate memory and copy over the relevant data structures to the GPU
+
+    // We pass double pointers for you to initialize the relevant device pointers,
+    //  which are passed to the other two functions.
+
+    // Useful snippet for error checking
+    // cudaError_t error = cudaGetLastError();
+    // if(error != cudaSuccess)
+    // {
+    //     std::cout<<"CUDA error: "<<cudaGetErrorString(error)<<std::endl;
+    //     exit(-1);
+    // }
+    const int W_out = (W-K)/S + 1;
+    const int H_out = (H-K)/S + 1;
+
+    // OPTIMIZATION 2: This is part of the constant memory optimization, putting the mask in constant memory 
+    cudaMemcpyToSymbol(mask_constant_memory, host_mask, M * C * K * K * sizeof(float));
+
+    cudaMalloc((void**)device_input_ptr, B * C * H * W * sizeof(float));
+    cudaMalloc((void**)device_output_ptr, B * M * H_out * W_out * sizeof(float));
+
+    cudaMemcpy(*device_input_ptr, host_input, B * C * H * W * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+
+__host__ void GPUInterface::conv_forward_gpu(float *device_output, const float *device_input, const float *device_mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
+{
+    // Set the kernel dimensions and call the kernel
+    int W_size = ceil((float) (W)/TILE_WIDTH); 
+    int H_size = ceil((float) (H)/TILE_WIDTH); 
+    
+    // block and grid dimensions
+    dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1); // output tile for untiled code
+    dim3 gridDim(B, M, H_size * W_size);
+
+
+    conv_forward_kernel<<<gridDim, blockDim>>>(device_output, device_input, device_mask, B, M, C, H, W, K, S);
+}
+
+
+__host__ void GPUInterface::conv_forward_gpu_epilog(float *host_output, float *device_output, float *device_input, float *device_mask, const int B, const int M, const int C, const int H, const int W, const int K, const int S)
+{
+    // Copy the output back to host
+    const int H_out = (H - K)/S + 1;
+    const int W_out = (W - K)/S + 1;
+    
+    cudaMemcpy(host_output, device_output, B * M * H_out * W_out * sizeof(float), cudaMemcpyDeviceToHost);
+    
+    // Free device memory
+    cudaFree(device_output);
+    cudaFree(device_input);
+    cudaFree(device_mask);
+}
+
+
+__host__ void GPUInterface::get_device_properties()
+{
+    int deviceCount;
+    cudaGetDeviceCount(&deviceCount);
+
+    for(int dev = 0; dev < deviceCount; dev++)
+    {
+        cudaDeviceProp deviceProp;
+        cudaGetDeviceProperties(&deviceProp, dev);
+
+        std::cout<<"Device "<<dev<<" name: "<<deviceProp.name<<std::endl;
+        std::cout<<"Computational capabilities: "<<deviceProp.major<<"."<<deviceProp.minor<<std::endl;
+        std::cout<<"Max Global memory size: "<<deviceProp.totalGlobalMem<<std::endl;
+        std::cout<<"Max Constant memory size: "<<deviceProp.totalConstMem<<std::endl;
+        std::cout<<"Max Shared memory size per block: "<<deviceProp.sharedMemPerBlock<<std::endl;
+        std::cout<<"Max threads per block: "<<deviceProp.maxThreadsPerBlock<<std::endl;
+        std::cout<<"Max block dimensions: "<<deviceProp.maxThreadsDim[0]<<" x, "<<deviceProp.maxThreadsDim[1]<<" y, "<<deviceProp.maxThreadsDim[2]<<" z"<<std::endl;
+        std::cout<<"Max grid dimensions: "<<deviceProp.maxGridSize[0]<<" x, "<<deviceProp.maxGridSize[1]<<" y, "<<deviceProp.maxGridSize[2]<<" z"<<std::endl;
+        std::cout<<"Warp Size: "<<deviceProp.warpSize<<std::endl;
+    }
+}
